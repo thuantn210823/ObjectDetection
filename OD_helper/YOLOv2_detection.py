@@ -104,13 +104,3 @@ class Resnet18(nn.Module):
         delattr(self.net, "fc")
     def forward(self, X: torch.Tensor):
         return self.net.layer4(self.net.layer3(self.net.layer2(self.net.layer1(self.net.maxpool(self.net.relu(self.net.bn1(self.net.conv1(X))))))))
-
-class Resnet18(nn.Module):
-    def __init__(self,
-                 pretrained: bool = True, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.net = torchvision.models.resnet18(pretrained)
-        delattr(self.net, "avgpool")
-        delattr(self.net, "fc")
-    def forward(self, X: torch.Tensor):
-        return self.net.layer4(self.net.layer3(self.net.layer2(self.net.layer1(self.net.maxpool(self.net.relu(self.net.bn1(self.net.conv1(X))))))))

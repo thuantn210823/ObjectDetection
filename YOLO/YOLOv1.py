@@ -5,16 +5,22 @@ from torch import nn
 import torchvision
 from torchvision.transforms import v2
 
-import os
-import PIL
-from PIL import Image
-
 from OD_datasets import VOCDetection, OD_transform, VOC_I2N
 from OD_utils import visualize
 from YOLOv1_detection import *
 import S4T as S
 
 class PascalVOC2012(S.SDataModule):
+    """
+    Pascal VOC 2012 dataset.
+
+    Parameters:
+    root: str - Root directory of the VOC Dataset.
+    download: bool - Whether to download dataset or not
+    train_transforms: Optional[Callable] - Data augmentations for train data.
+    test_transforms: Optional[Callable] - Data augmentations for test data.
+    batch_size: int - The number of samples per batch.
+    """
     def __init__(self,
                  root: str,
                  download: bool,
@@ -50,6 +56,15 @@ class PascalVOC2012(S.SDataModule):
         return torch.stack(img_batch), tar_batch
 
 class MyYOLO_ResNet18(S.SModule):
+    """
+    My YOLO Model. I used ResNet18 as backbone which has the final feature map's shape is 16x16 differing from the the DarkNet in the original paper.
+
+    Parameters:
+    grid_size: tuple - Determine how the image should be divided.
+    num_classes: int - The number of labels.
+    num_boxes_per_gridcell: int - The number of boxes per grid cell.
+    lr: float - The learning rate value.
+    """
     def __init__(self,
                  grid_size: Tuple[int, int],
                  num_classes: int,
@@ -66,6 +81,13 @@ class MyYOLO_ResNet18(S.SModule):
                                    kernel_size = 3, padding = 1)
 
     def forward(self, X: torch.Tensor):
+        """
+        Parameters:
+        X: Tensor - The input image, shape (N, C, H, W)
+
+        Returns:
+        Tensor in (0, 1), which is different from the original paper.
+        """
         out = self.backbone(X)
         out = self.predictor(out).permute(0, 2, 3, 1)
         return torch.sigmoid(out)
@@ -73,6 +95,11 @@ class MyYOLO_ResNet18(S.SModule):
     def loss(self,
              preds: torch.Tensor,
              targets: List[dict]):
+        """
+        Loss function. In here we do the same procedure for any object detection problem.
+        - Assign target bounding boxes to gridcells/anchors.
+        - Calcuate classification loss and localization loss.
+        """
         grid_cell_h, grid_cell_w = self.box_coder.image_size[0]/self.grid.grid_size[0], \
                                    self.box_coder.image_size[1]/self.grid.grid_size[1]
 
@@ -81,13 +108,20 @@ class MyYOLO_ResNet18(S.SModule):
         obj_conf_loss = 0
         noobj_conf_loss = 0
         prob_loss = 0
-        for preds_per_img, targets_per_img in zip(preds, targets):                                   # (S, S, (B*5+C)) vs (m, )
+        # I used one for-loop to avoid the case that the number of objects are different in batch.
+        for preds_per_img, targets_per_img in zip(preds, targets):                                                                          # (S, S, (B*5+C)) vs (m, )
             if targets_per_img['boxes'].numel() == 0:
                 continue
+            #### STEP 1: Assign labels.
+            # Because each gridcell will take responsibility for one object, if there has the number of 
+            # objects is greater than the number of gridcells, some will be removed. To fix that, in each interation
+            # I shuffle the targets for better regularation. 
             shuffle_idxs = torch.randperm(targets_per_img['boxes'].shape[0])
-            gt_bboxes_per_img = torchvision.ops.box_convert(targets_per_img['boxes'], 'xyxy', 'cxcywh')[shuffle_idxs]                         # (m, 4)
+            # Get the annotations, and transform to the right formats.
+            gt_bboxes_per_img = torchvision.ops.box_convert(targets_per_img['boxes'], 'xyxy', 'cxcywh')[shuffle_idxs]                       # (m, 4)
             gt_logits_per_img = nn.functional.one_hot(targets_per_img['labels']-1, self.num_classes).type(torch.float)[shuffle_idxs]        # (m, C)
-
+            
+            # Get the object addresses (cx, cy), and use them to asgin labels for gridcells.
             foreground_gc_idxs_per_img = gt_bboxes_per_img[:, :2].clone()
             foreground_gc_idxs_per_img[:, 0] = foreground_gc_idxs_per_img[:, 0]//grid_cell_w
             foreground_gc_idxs_per_img[:, 1] = foreground_gc_idxs_per_img[:, 1]//grid_cell_h
@@ -96,23 +130,25 @@ class MyYOLO_ResNet18(S.SModule):
             gc_idxs_per_img = torch.full(preds_per_img.shape[:2], -1,
                                           dtype = torch.long,
                                           device = preds.device)
+            # Assigning objects for correspoding girdcells.
             gc_idxs_per_img[foreground_gc_idxs_per_img[:, 1], foreground_gc_idxs_per_img[:, 0]] = torch.arange(start = 0,
                                                                                                                end = len(gt_bboxes_per_img),
                                                                                                                dtype = torch.long,
                                                                                                                device = preds.device)
-            gt_matched_idxes_per_img = gc_idxs_per_img[gc_idxs_per_img >= 0] # (objs, )
+            gt_matched_idxes_per_img = gc_idxs_per_img[gc_idxs_per_img >= 0]                                                                # (objs, )
             num_foreground += len(gt_matched_idxes_per_img)
-            foreground_preds_per_img = preds_per_img[gc_idxs_per_img >= 0]   # (objs, (B*5+C))
-            background_preds_per_img = preds_per_img[gc_idxs_per_img < 0]    # (noobjs, (B*5+C))
+            foreground_preds_per_img = preds_per_img[gc_idxs_per_img >= 0]                                                                  # (objs, (B*5+C))
+            background_preds_per_img = preds_per_img[gc_idxs_per_img < 0]                                                                   # (noobjs, (B*5+C))
 
+            #### STEP 2: Calulate losses. 
             # noobjs
             noobj_conf_loss += (background_preds_per_img[:, :self.num_boxes_per_gridcell].reshape(-1)**2).sum()
 
             # objs
-            conf_obj_preds_per_img = foreground_preds_per_img[:, :self.num_boxes_per_gridcell]                  # (objs, B)
+            conf_obj_preds_per_img = foreground_preds_per_img[:, :self.num_boxes_per_gridcell]                                              # (objs, B)
             offset_preds_per_img = foreground_preds_per_img[:, self.num_boxes_per_gridcell:-self.num_classes]\
-                                    .reshape(-1, self.num_boxes_per_gridcell, 4)                                # (objs, B, 4)
-            prob_preds_per_img = foreground_preds_per_img[:, -self.num_classes:]                                # (objs, C)
+                                    .reshape(-1, self.num_boxes_per_gridcell, 4)                                                            # (objs, B, 4)
+            prob_preds_per_img = foreground_preds_per_img[:, -self.num_classes:]                                                            # (objs, C)
             ## prob_loss
             prob_loss += nn.functional.mse_loss(prob_preds_per_img,
                                                 gt_logits_per_img[gt_matched_idxes_per_img], reduction = 'sum')
@@ -120,6 +156,7 @@ class MyYOLO_ResNet18(S.SModule):
             # predict_iou
             max_iou_box_idxs = []
             iou_preds = []
+            # Scan to find the best prior box taking responsibility for the correspoding object.
             for foreground_offsets, gt_box, upper_lefts in zip(offset_preds_per_img,
                                                                gt_bboxes_per_img[gt_matched_idxes_per_img],
                                                                foreground_gc_idxs_per_img[gt_matched_idxes_per_img]):
@@ -184,6 +221,13 @@ def predict(model: nn.Module,
             obj_conf_thres: float,
             cls_conf_thres: float,
             nms_thres: float):
+    """
+    model: Module - The object detection model.
+    X: Tensor - The input image, shape (1, C, H, W).
+    obj_conf_thres: The threshold for determining objects.
+    cls_conf_thres: The threshold for determining the class of objects.
+    nms_thres: The non-maximum suppression threshold.
+    """
     grid_cell_h, grid_cell_w = model.box_coder.image_size[0]/model.grid.grid_size[0], \
                                model.box_coder.image_size[1]/model.grid.grid_size[1]
     model.eval()

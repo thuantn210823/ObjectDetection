@@ -5,9 +5,6 @@ from torch import nn
 import torchvision
 from torchvision.transforms import v2
 
-import os
-import PIL
-from PIL import Image
 import collections
 
 from OD_datasets import VOCDetection, OD_transform, VOC_I2N
@@ -16,6 +13,16 @@ from YOLOv2_detection import *
 import S4T as S
 
 class PascalVOC2012(S.SDataModule):
+    """
+    Pascal VOC 2012 dataset.
+
+    Parameters:
+    root: str - Root directory of the VOC Dataset.
+    download: bool - Whether to download dataset or not
+    train_transforms: Optional[Callable] - Data augmentations for train data.
+    test_transforms: Optional[Callable] - Data augmentations for test data.
+    batch_size: int - The number of samples per batch.
+    """
     def __init__(self,
                  root: str,
                  download: bool,
@@ -51,6 +58,17 @@ class PascalVOC2012(S.SDataModule):
         return torch.stack(img_batch), tar_batch
 
 class MyYOLO_ResNet18(S.SModule):
+    """
+    My YOLO Model. I used ResNet18 as backbone which has the final feature map's shape is 16x16 differing from the the DarkNet in the original paper.
+
+    Parameters:
+    grid_size: tuple - Determine how the image should be divided.
+    num_classes: int - The number of labels.
+    anchor_size: List[[int, int]] - The prior boxes, which should be determined by K-means following by the recommendation in the original paper.
+    iou_thres: float - The threshold value for assgining anchors.
+    lr: float - The learning rate value.
+    image_size: tuple - The image size of batch.
+    """
     def __init__(self,
                  grid_size: Tuple[int, int],
                  num_classes: int,
@@ -80,6 +98,14 @@ class MyYOLO_ResNet18(S.SModule):
     def loss(self,
              preds: torch.Tensor,
              targets: List[dict]):
+        """
+        Loss function. In here we do the same procedure for any object detection problem.
+        - Assign target bounding boxes to gridcells/anchors.
+        - Calcuate classification loss and localization loss.
+
+        Notes: In this version, there are few changes for the previous work and the original paper. Instead of using
+        the MSE loss, I used Binary Cross entropy loss and Cross entropy loss for object loss, and clasification loss. 
+        """
         grid_cell_h, grid_cell_w = self.image_size[0]/self.grid_size[0], \
                                    self.image_size[1]/self.grid_size[1]
 
@@ -89,13 +115,18 @@ class MyYOLO_ResNet18(S.SModule):
         noobj_conf_loss = 0
         prob_loss = 0
         total_iou = 0
-        for preds_per_img, targets_per_img in zip(preds, targets):                                   # (S, S, B, 5+C) vs (m, )
+        # I used one for-loop to avoid the case that the number of objects are different in batch.
+        for preds_per_img, targets_per_img in zip(preds, targets):                                                                            # (S, S, B, 5+C) vs (m, )
             if targets_per_img['boxes'].numel() == 0:
                 continue
+            #### STEP 1: Assign labels.
+            # The same idea with YOLO v1 implementation, I will shuffle before assigning, for the number of prior boxes is finite.
             shuffle_idxs = torch.randperm(targets_per_img['boxes'].shape[0])
+            # Get the annotations, and transform to the right formats.
             gt_bboxes_per_img = torchvision.ops.box_convert(targets_per_img['boxes'], 'xyxy', 'cxcywh')[shuffle_idxs]                         # (m, 4)
             gt_logits_per_img = nn.functional.one_hot(targets_per_img['labels']-1, self.num_classes).type(torch.float)[shuffle_idxs]          # (m, C)
 
+            # Get the object addresses (cx, cy), and use them to asgin labels for gridcells.
             foreground_gc_idxs_per_img = gt_bboxes_per_img[:, :2].clone()
             foreground_gc_idxs_per_img[:, 0] = foreground_gc_idxs_per_img[:, 0]//grid_cell_w
             foreground_gc_idxs_per_img[:, 1] = foreground_gc_idxs_per_img[:, 1]//grid_cell_h
@@ -107,7 +138,8 @@ class MyYOLO_ResNet18(S.SModule):
             foreground_gc_matched_idxs = collections.OrderedDict(sorted(foreground_gc_matched_idxs.items()))
 
             matched_idxs_per_img = torch.full((self.grid_size[0], self.grid_size[1], self.num_boxes_per_gridcell), -1,
-                                              dtype = torch.int64, device = preds.device)                     # (S, S, B)
+                                              dtype = torch.int64, device = preds.device)                                                     # (S, S, B)
+            # Assign labels to prior boxes using IoU scores.
             assigned_anchors_per_img = []
             for gc_idx, matched_per_gc in foreground_gc_matched_idxs.items():
                 anchors = self.anchor_generator((gc_idx[1]*grid_cell_w, gc_idx[0]*grid_cell_h),
@@ -120,23 +152,24 @@ class MyYOLO_ResNet18(S.SModule):
                 matched_idxs_per_gc = fg_idxs_per_gc[fg_idxs_per_gc>=0]
                 matched_idxs_per_img[gc_idx[0], gc_idx[1]][fg_idxs_per_gc>=0] = matched_per_gc[matched_idxs_per_gc]
                 assigned_anchors_per_img.append(anchors[fg_idxs_per_gc>=0])
-            assigned_anchors_per_img = torch.concat(assigned_anchors_per_img, dim = 0)                         # (objs, 4)
+            assigned_anchors_per_img = torch.concat(assigned_anchors_per_img, dim = 0)                                                         # (objs, 4)
 
-            foreground_preds_per_img = preds_per_img[matched_idxs_per_img >= 0]                                # (objs, 5+C)
-            background_preds_per_img = preds_per_img[matched_idxs_per_img < 0]                                 # (noobjs, 5+C)
+            foreground_preds_per_img = preds_per_img[matched_idxs_per_img >= 0]                                                                # (objs, 5+C)
+            background_preds_per_img = preds_per_img[matched_idxs_per_img < 0]                                                                 # (noobjs, 5+C)
             gt_matched_idxes_per_img = matched_idxs_per_img[matched_idxs_per_img >= 0]
             num_foreground += len(gt_matched_idxes_per_img)
 
+            #### STEP 2: Calulate losses. 
             # noobjs
             neg_ratio = 3*len(gt_matched_idxes_per_img)/background_preds_per_img.shape[0]
             background_preds_per_img = background_preds_per_img[:, 0].reshape(-1)[torch.rand(background_preds_per_img.shape[0],)<neg_ratio]
             noobj_conf_loss += nn.functional.binary_cross_entropy(torch.sigmoid(background_preds_per_img),
                                                               torch.tensor([0]*len(background_preds_per_img)).to(preds), reduction = 'sum')
             # objs
-            conf_obj_preds_per_img = torch.sigmoid(foreground_preds_per_img[:, 0])                              # (objs, 1)
-            offset_preds_per_img = foreground_preds_per_img[:, 1:  5]                                           # (objs, 4)
+            conf_obj_preds_per_img = torch.sigmoid(foreground_preds_per_img[:, 0])                                                              # (objs, 1)
+            offset_preds_per_img = foreground_preds_per_img[:, 1:  5]                                                                           # (objs, 4)
             offset_preds_per_img[:, :2] = torch.sigmoid(offset_preds_per_img[:, :2])
-            prob_preds_per_img = foreground_preds_per_img[:, -self.num_classes:]                                # (objs, C)
+            prob_preds_per_img = foreground_preds_per_img[:, -self.num_classes:]                                                                # (objs, C)
             ## prob_loss
             prob_loss += nn.functional.cross_entropy(prob_preds_per_img,
                                                      gt_logits_per_img[gt_matched_idxes_per_img], reduction = 'sum')
@@ -197,7 +230,12 @@ def predict(model: nn.Module,
             nms_thres: float,
             cls_loss_type: Optional[str] = 'CE'):
     """
-    cls_loss: "CE"/"ce" or "BCE"/bce. If "CE" was used softmax will be used for inference else sigmoid will be used instead.
+    Parameters:
+    model: Module: The object detection model.
+    obj_conf_thres: The threshold for determining objects.
+    cls_conf_thres: The threshold for determining the class of objects.
+    nms_thres: The non-maximum suppression threshold.
+    cls_loss_type: "CE"/"ce" or "BCE"/bce. If "CE" was used softmax will be used for inference else sigmoid will be used instead.
     """
     cls_map = {"bce": torch.sigmoid,
                "ce": lambda x: torch.softmax(x, dim = -1)}
